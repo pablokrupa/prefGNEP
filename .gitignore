@@ -1,0 +1,15 @@
+__pycache__/
+**/__pycache__/ 
+.vscode
+*.log
+*.so
+*.o
+*.eps
+build/
+**/test_*
+.DS_Store
+.idea/
+notes.txt
+notes.md
+/personal
+*.pkl
