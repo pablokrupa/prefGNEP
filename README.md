@@ -44,6 +44,7 @@ $$f_i(x^{\*}_{i}, x^{\*}_{-i}) \leq f_i(x_i, x^{\*}_{-i})$$
 for all feasible $x=(x_i,x_{-i}^*)$.
 
 **prefGNEP** learns an approximate GNE $x^*$ by iteratively fitting surrogate cost functions $\hat{f}_i$ of a GNEP using preferences that are selected using an AL strategy that balances exploitation (querying near a GNE of current surrogate GNEP) and exploration (querying in unknown regions).
+We refer the user to the paper preprint [Learning generalized Nash equilibria from pairwise preferences](https://arxiv.org/abs/2603.17015) for a description of the method.
 
 ## Basic Usage
 
@@ -121,7 +122,7 @@ python -m pip install nashopt tqdm matplotlib pyswarms
   title = {Learning generalized {N}ash equilibria from pairwise preferences},
   author = {Krupa, Pablo and Bemporad, Alberto},
   year = {2026},
-  journal = {arXiv preprint arXiv:xxxx.yyyy},
+  journal = {arXiv preprint arXiv:2603.17015},
 }
 ```
 

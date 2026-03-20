@@ -1,13 +1,13 @@
 # Reproducibility Instructions
 
-This readme describes how to recreate the exact software environment used to generate the numerical results in the accompanying paper shown below, and how to re-run the example scripts.
+This readme describes how to recreate the exact software environment used to generate the numerical results in the accompanying [paper preprint](https://arxiv.org/abs/2603.17015) (Bibtex shown below), and how to run the example scripts.
 
 ```bibtex
 @article{Krupa_prefGNEP_arXiv_2026,
   title = {Learning generalized {N}ash equilibria from pairwise preferences},
   author = {Krupa, Pablo and Bemporad, Alberto},
   year = {2026},
-  journal = {arXiv preprint arXiv:xxxx.yyyy},
+  journal = {arXiv preprint arXiv:2603.17015},
 }
 ```
 
