@@ -19,7 +19,7 @@ from pref_gnep import PrefGNEP  # noqa: E402
 from dataset import DataSet  # noqa: E402
 from models import gen_quad_models  # noqa: E402
 
-seed = 1234
+seed = 123
 np.random.seed(seed)
 
 # %% #################################
@@ -32,9 +32,9 @@ ds_size_init = 50  # Dimension of initial dataset
 n_iters_AL = 80  # Number of iterations of the AL loop
 delta = 0.5  # Exploration parameter in the AL loop
 p_delta = 5.0  # Exponent for exploration parameter decay in the AL loop
-delta_min = 1e-3  # Minimum value of exploration parameter in the AL loop
+delta_min = 1e-4  # Minimum value of exploration parameter in the AL loop
 sigma = 0.3  # Noise parameter for the AL loop
-p_sigma = 4.0  # Exponent for noise parameter decay in the AL loop
+p_sigma = 3.0  # Exponent for noise parameter decay in the AL loop
 sigma_min = 1e-3  # Minimum value of noise parameter in the AL loop
 
 sizes = [1, 1]
@@ -120,7 +120,7 @@ ds, hist_l = pref_gnep.fit_AL_loop(f_real, ds, n_iters=n_iters_AL, x0=x0,
                                    sigma=sigma, p_sigma=p_sigma, sigma_min=sigma_min,
                                    delta=delta, p_delta=p_delta, delta_min=delta_min,
                                    store_gnep_sol=True, store_accuracy=True, f_eval=x_star_eval,
-                                   verbose=2, seed=seed)
+                                   verbose=2, seed=seed, update_th_0=True)
 
 # Compute the Nash equilibrium with the learned parameters
 sol_pref = pref_gnep.solve_gnep(x0)
@@ -151,12 +151,27 @@ for i in range(gnep.N):
 print(f"\nAccuracy after learning loop: {pref_gnep.accuracy_score(ds):.4f}")
 print(f"|| x_star - x_pref ||_inf: {np.array2string(np.linalg.norm(x_star - sol_pref.x, ord=np.inf), precision=4)}")
 
+# Compute the average of the last num_final solutions
+x_pref_mean = np.mean(hist_l.x_star[-5:], axis=0)
+eval_pref_mean = []
+for i in range(N):
+    sol_br_mean = gnep.best_response(i, x_pref_mean)
+    eval_pref_mean.append(np.linalg.norm(sol_br_mean.x - x_pref_mean) / np.linalg.norm(sol_br_mean.x))
+max_br_dev = np.max(np.array(eval_pref_mean))
+
+dev_star_mean = np.linalg.norm(x_star - x_pref_mean) / np.linalg.norm(x_star)
+
+print(f"Difference between mean of the last 5 x_pref and x_star: {dev_star_mean:.6f}")
+print(f"Max BR deviation of the mean of the last 5 x_pref: {max_br_dev:.6f}")
+
 # %% #################################
 # Plots
 ######################################
 
 colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 mpl.rcParams.update({
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
     "axes.labelsize": 19,
     "font.size": 20,
     "legend.fontsize": 18,

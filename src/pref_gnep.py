@@ -6,6 +6,7 @@ Provides tools for fitting surrogate cost functions from pairwise preference dat
 """
 
 import numpy as np
+import functools
 import jax
 import jax.numpy as jnp
 from nashopt import GNEP, ParametricGNEP
@@ -14,6 +15,7 @@ import copy
 from tqdm import tqdm
 import pyswarms as ps
 from jax.typing import ArrayLike
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Callable, NamedTuple
 from types import SimpleNamespace
 from timeit import default_timer as timer
@@ -36,7 +38,8 @@ class MinimizeInfo(NamedTuple):
     lbfgs_hess_eval: int  # Number of Hessian evaluations of the L-BFGS solver
 
 
-class ALloopInfo(NamedTuple):
+@dataclass
+class ALloopInfo:
     """
     Class to store the information of the active learning loop.
 
@@ -75,20 +78,27 @@ class ALloopInfo(NamedTuple):
         minimum value of f_eval at the GNEP solution. Only stored if store_best_th is True
         and f_eval is provided in fit_AL_loop().
     """
-    x_star: list[ArrayLike] = []
-    accuracy: list[float] = []
-    times: list[float] = []
-    eval: list[float] = []
-    tol_gnep: list[float] = []
-    tol_eval: list[float] = []
-    res_x_star: list[float] = []
-    res_ds_gnep: list[float] = []
-    res_ds_br: list[list[bool]] = []
-    delta: list[float] = []
-    sigma: list[float] = []
-    mu_th: list[float] = []
+    x_star: list[ArrayLike] = field(default_factory=list)
+    accuracy: list[float] = field(default_factory=list)
+    times: list[float] = field(default_factory=list)
+    eval: list[float] = field(default_factory=list)
+    tol_gnep: list[float] = field(default_factory=list)
+    tol_eval: list[float] = field(default_factory=list)
+    res_x_star: list[float] = field(default_factory=list)
+    res_ds_gnep: list[float] = field(default_factory=list)
+    res_ds_br: list[list[bool]] = field(default_factory=list)
+    delta: list[float] = field(default_factory=list)
+    sigma: list[float] = field(default_factory=list)
+    mu_th: list[float] = field(default_factory=list)
     n_iters: int = 0
     best_th: dict | list[ArrayLike] | None = None
+
+    def _asdict(self):
+        import dataclasses
+        return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+
+    def _replace(self, **kwargs):
+        return _dc_replace(self, **kwargs)
 
     def to_array(self):
         """Converts the lists in ALLoopInfo to numpy arrays."""
@@ -111,111 +121,107 @@ class ALloopInfo(NamedTuple):
         return self._replace(n_iters=len(self.times))
 
 
-def adam_solver(JdJ, z, solver_iters, adam_eta, verbose, params_min=None, params_max=None):
-    """
-    Solves a nonlinear optimization problem using the Adam optimization algorithm.
+def adam_solver(value_and_grad_fn, z, solver_iters: int, adam_eta: float, iprint: int,
+                params_min=None, params_max=None):
+    """JIT-accelerated Adam optimiser for pytree parameters.
+
+    The entire step (loss + gradient + parameter update + bound clipping) is
+    compiled into a single XLA kernel via ``@jax.jit``.
 
     Parameters
     ----------
-    JdJ : callable
-        A function that computes the objective function value and its gradient.
-    z : dict or list
-        A dict or list of numpy arrays representing the initial guess of the optimization variables.
+    value_and_grad_fn : callable
+        ``value_and_grad_fn(z) -> (f, grad)``.  Must be JIT-compatible.
+        Typically ``jax.value_and_grad(loss_fn)``.
+    z : pytree of jnp.ndarray
+        Initial parameter pytree.
     solver_iters : int
-        The number of iterations for the solver.
+        Number of Adam iterations.
     adam_eta : float
-        The learning rate for the Adam algorithm.
-    verbose : int
-        Verbosity level. Set to 0 to disable printing.
-    params_min : dict or list, optional
-        A dict or list of numpy arrays representing the lower bounds of the optimization variables z.
-        Lower bounds are enforced by clipping the variables during the iterations.
-    params_max : dict or list, optional
-        A dict or list of numpy arrays representing the upper bounds of the optimization variables z.
-        Upper bounds are enforced by clipping the variables during the iterations.
+        Learning rate.
+    iprint : int
+        Verbosity level; 0 = silent, >0 = progress bar.
+    params_min : same structure as ``z``, optional
+        Element-wise lower bounds.
+    params_max : same structure as ``z``, optional
+        Element-wise upper bounds.
 
     Returns
     -------
-    tuple
-        A tuple containing the optimized variables `z` and the objective function value `Jopt`.
-
-    Note: Function taken from https://github.com/bemporad/jax-sysid
+    z_opt : same structure as ``z``
+        Optimised parameters (best found).
+    f_opt : float
+        Loss at ``z_opt``.
     """
-    # Flatten z
-    z_l, z_def = jax.tree_util.tree_flatten(z)
+    beta1, beta2, eps = 0.9, 0.999, 1e-8
+    m = jax.tree_util.tree_map(jnp.zeros_like, z)
+    v = jax.tree_util.tree_map(jnp.zeros_like, z)
 
-    if verbose > 0:
-        iters_tqdm = tqdm(total=solver_iters, desc='Iterations', ncols=30,
-                          bar_format='{percentage:3.0f}%|{bar}|', leave=True, position=0)
+    def _clip(z_):
+        if params_min is not None:
+            z_ = jax.tree_util.tree_map(jnp.maximum, z_, params_min)
+        if params_max is not None:
+            z_ = jax.tree_util.tree_map(jnp.minimum, z_, params_max)
+        return z_
+
+    z = _clip(z)
+
+    @jax.jit
+    def step(z, m, v, beta1t, beta2t):
+        f, df = value_and_grad_fn(z)
+        m = jax.tree_util.tree_map(lambda mi, gi: beta1 * mi + (1 - beta1) * gi, m, df)
+        v = jax.tree_util.tree_map(lambda vi, gi: beta2 * vi + (1 - beta2) * gi ** 2, v, df)
+        z = jax.tree_util.tree_map(
+            lambda zi, mi, vi: zi - adam_eta / (1 - beta1t) * mi / (jnp.sqrt(vi / (1 - beta2t)) + eps),
+            z, m, v,
+        )
+        z = _clip(z)
+        grad_norm = jnp.sqrt(sum(jnp.sum(leaf ** 2) for leaf in jax.tree_util.tree_leaves(df)))
+        return z, m, v, f, grad_norm
+
+    if iprint > 0:
+        from tqdm import tqdm
+        nvars = sum(leaf.size for leaf in jax.tree_util.tree_leaves(z))
+        print(f"Adam optimiser ({nvars} variables) ...")
+        pbar = tqdm(total=solver_iters, desc='Adam', ncols=50, leave=True, position=0)
         loss_log = tqdm(total=0, position=1, bar_format='{desc}')
-        nvars = sum([zi.size for zi in z_l])
-        print("Solving NLP with Adam (%d optimization variables) ..." % nvars)
 
-    nz = len(z_l)
-    fbest = np.inf
-    v = [np.zeros(zi.shape) if hasattr(zi, 'shape') else 0.0 for zi in z_l]
-    m = [np.zeros(zi.shape) if hasattr(zi, 'shape') else 0.0 for zi in z_l]
-    beta1 = 0.9
-    beta2 = 0.999
-    beta1t = beta1
-    beta2t = beta2
-    epsil = 1e-8
-
-    ismin = (params_min is not None)
-    ismax = (params_max is not None)
-    if params_min is not None:
-        params_min_l, _ = jax.tree_util.tree_flatten(params_min)
-    if params_max is not None:
-        params_max_l, _ = jax.tree_util.tree_flatten(params_max)
-    isbounded = ismin or ismax
-
-    if isbounded:
-        # Clip the initial guess, when required
-        for j in range(nz):
-            if ismin:
-                z_l[j] = np.maximum(z_l[j], params_min_l[j])
-            if ismax:
-                z_l[j] = np.minimum(z_l[j], params_max_l[j])
+    fbest = jnp.array(jnp.inf)
+    zbest = z
+    z_prev = z
+    beta1t = jnp.array(beta1)
+    beta2t = jnp.array(beta2)
 
     for k in range(solver_iters):
-        f, df = JdJ(z_l, z_def)
-        df_l, _ = jax.tree_util.tree_flatten(df)
-        if fbest > f:
+        z, m, v, f, grad_norm = step(z, m, v, beta1t, beta2t)
+        # f = loss(z_prev), z = updated params.  Track the z that produced f.
+        f_val = float(f)
+        if f_val < float(fbest):
             fbest = f
-            zbest = z_l.copy()
-        for j in range(nz):
-            m[j] = beta1 * m[j] + (1 - beta1) * df_l[j]
-            v[j] = beta2 * v[j] + (1 - beta2) * df_l[j]**2
-            # classical Adam step
-            z_l[j] -= adam_eta / (1 - beta1t) * m[j] / (np.sqrt(v[j] / (1 - beta2t)) + epsil)
-        if isbounded:
-            for j in range(nz):
-                if ismin:
-                    z_l[j] = np.maximum(z_l[j], params_min_l[j])
-                if ismax:
-                    z_l[j] = np.minimum(z_l[j], params_max_l[j])
+            zbest = z_prev
+        z_prev = z
 
-        beta1t *= beta1
-        beta2t *= beta2
+        beta1t = beta1t * beta1
+        beta2t = beta2t * beta2
 
-        if verbose > 0:
-            str = f"    f = {f: 10.6f}, f* = {fbest: 8.6f}"
-            ndf = np.sum([np.linalg.norm(df_l[i])
-                          for i in range(nz)])
-            str += f", |grad f| = {ndf: 8.6f}"
-            str += f", iter = {k + 1}"
-            loss_log.set_description_str(str)
-            iters_tqdm.update(1)
+        if iprint > 0:
+            s = f"    f = {f_val:10.6f}, f* = {float(fbest):8.6f}"
+            s += f", |grad f| = {float(grad_norm):8.6f}, iter = {k + 1}"
+            loss_log.set_description_str(s)
+            pbar.update(1)
 
-    z_l = zbest.copy()
-    Jopt, _ = JdJ(z_l, z_def)  # = fbest
-    z_sol = z_def.unflatten(z_l)
+    # Evaluate loss at the final z (its loss was never checked in the loop)
+    f_final = float(value_and_grad_fn(z)[0])
+    if f_final < float(fbest):
+        zbest = z
 
-    if verbose > 0:
-        iters_tqdm.close()
+    f_opt, _ = value_and_grad_fn(zbest)
+
+    if iprint > 0:
+        pbar.close()
         loss_log.close()
 
-    return z_sol, Jopt
+    return zbest, float(f_opt)
 
 
 class PrefGNEP:
@@ -232,7 +238,8 @@ class PrefGNEP:
 
     def __init__(self, sizes: list[int], fc: list[callable], g: list[callable] = None, ng: int = None,
                  h: list[callable] = None, nh: int = None, lb: ArrayLike = None, ub: ArrayLike = None,
-                 Aeq: ArrayLike = None, beq: ArrayLike = None, npar: int = 0):
+                 Aeq: ArrayLike = None, beq: ArrayLike = None, npar: int = 0,
+                 clear_jax_cache: bool = False):
         """
         Initialize the PrefGNEP object.
 
@@ -264,6 +271,12 @@ class PrefGNEP:
         npar : int, optional
             Number of parameters when dealing with a parametric GNEP.
             If 0, the problem is treated as a non-parametric GNEP. Default is 0.
+        clear_jax_cache : bool, optional
+            If True, call jax.clear_caches() each time the JIT-compiled loss functions are rebuilt
+            (i.e. after calling loss() or optimization()). This frees accumulated XLA executables and
+            prevents unbounded memory growth in long-running scripts that trigger many recompilations.
+            Disabled by default to avoid side effects on other JAX-compiled code in the same process.
+            Enable in scripts that call fit_AL_loop() many times (e.g. sensitivity analyses). Default is False.
 
         Notes
         -----
@@ -289,6 +302,10 @@ class PrefGNEP:
         self.npar = npar  # Number of parameters when dealing with parametric GNEP. If 0, we have a non-parametric GNEP.
         self._parametric = True if npar > 0 else False
         self._opt_ps = {'c1': 2.8, 'c2': 1.3, 'w': 0.9}  # Options for the particle swarm optimizer
+        self._clear_jax_cache = clear_jax_cache
+        self._compiled = False   # True once _build_loss_fns() has been called
+        self._loss_fns = None    # List of jit-compiled loss functions, one per player
+        self._max_size = None    # int | None; set by fit_AL_loop() to enable fixed-shape dataset padding
         self._compute_idx()
 
     def _compute_idx(self):
@@ -336,6 +353,7 @@ class PrefGNEP:
         self.alpha2 = alpha2
         self.pmin = pmin
         self.pmax = pmax
+        self._compiled = False
 
     def loss(self, rho_th: float = 0.001, mu_th: float = 0.0, epsilon: float = 1.e-6) -> None:
         """
@@ -356,6 +374,7 @@ class PrefGNEP:
         self.rho_th = rho_th
         self.mu_th = mu_th
         self.epsilon = epsilon
+        self._compiled = False
 
     def optimization(self, adam_eta: float = 0.001, adam_epochs: int = 0, lbfgs_epochs: int = 1000, verbose: int = -1,
                      memory: int = 10, lbfgs_tol: float = 1.e-16, lbfgs_maxiter: int = 1000, lbfgs_maxls: int = 20,
@@ -389,7 +408,7 @@ class PrefGNEP:
         assert lbfgs_epochs >= 0, "Expected lbfgs_epochs to be non-negative"
         assert memory > 0, "Expected memory to be positive"
         assert lbfgs_tol >= 0.0, "Expected lbfgs_tol to be non-negative"
-        assert lbfgs_maxiter > 0, "Expected lbfgs_maxiter to be positive"
+        assert lbfgs_maxiter >= 0, "Expected lbfgs_maxiter to be positive"
         assert lbfgs_maxls > 0, "Expected lbfgs_maxls to be positive"
         self.adam_eta = adam_eta
         self.adam_epochs = adam_epochs
@@ -400,6 +419,43 @@ class PrefGNEP:
         self.lbfgs_maxiter = lbfgs_maxiter
         self.lbfgs_maxls = lbfgs_maxls
         self.jit = jit
+        self._compiled = False
+
+    @staticmethod
+    def _loss_fn_base(th, samples, xA_i, xB_i, prefs_i, dist_i, mask,
+                      th_curr, mu_th, fc_i, x_mi_fn, epsilon, rho_th):
+        def single_loss(x_j, xA_j, xB_j, p_j, dist_j):
+            x_mi_j = x_mi_fn(x_j)
+            fA = fc_i(th, xA_j, x_mi_j)
+            fB = fc_i(th, xB_j, x_mi_j)
+            P = 1.0 / (1.0 + jnp.exp((fA - fB) / dist_j))
+            return -p_j * jnp.log(P + epsilon) - (1.0 - p_j) * jnp.log(1.0 - P + epsilon)
+        total_loss = jnp.sum(
+            jax.vmap(single_loss)(samples, xA_i, xB_i, prefs_i, dist_i) * mask
+        ) / jnp.sum(mask)
+        for param, param_0 in zip(jax.tree_util.tree_leaves(th), jax.tree_util.tree_leaves(th_curr)):
+            total_loss += rho_th * jnp.sum(param ** 2)
+            total_loss += mu_th * jnp.sum((param - param_0) ** 2)
+        return total_loss
+
+    def _build_loss_fns(self) -> None:
+        """Build (or rebuild) per-player JIT-compiled loss functions.
+        Called automatically the first time fit() / fit_AL_loop() needs them, and whenever
+        loss() or optimization() sets self._compiled = False."""
+        if self._clear_jax_cache:
+            jax.clear_caches()
+        self._loss_fns = []
+        for i in range(self.N):
+            loss_i_partial = functools.partial(
+                PrefGNEP._loss_fn_base,
+                fc_i=self.fc[i],
+                x_mi_fn=functools.partial(self.x_mi, i=i),
+                epsilon=self.epsilon,
+                rho_th=self.rho_th,
+            )
+            loss_i = jax.jit(loss_i_partial) if self.jit else loss_i_partial
+            self._loss_fns.append(loss_i)
+        self._compiled = True
 
     def fit(self, ds: DataSet, mu_th: float = None, update: bool = True,
             th_0: list[list[ArrayLike] | dict] = None) -> tuple[list[ArrayLike | dict], list[MinimizeInfo], SimpleNamespace]:
@@ -437,15 +493,17 @@ class PrefGNEP:
         infos = []
         if th_0 is None:
             th_0 = [None for _ in range(self.N)]
+        new_th = [None for _ in range(self.N)]
         for i in range(self.N):
-            _, info_lbfgs_i = self._fit_i(i, ds.samples, ds.xA[i], ds.xB[i], ds.prefs[i], dist_i=ds.dist[i],
-                                          mu_th=mu_th, update=update, th_0=th_0[i])
+            th_i, info_lbfgs_i = self._fit_i(i, ds.samples, ds.xA[i], ds.xB[i], ds.prefs[i], dist_i=ds.dist[i],
+                                             mu_th=mu_th, update=update, th_0=th_0[i])
+            new_th[i] = th_i
             infos.append(info_lbfgs_i)
 
         stats = SimpleNamespace(time=0.0)
         for info in infos:
             stats.time += info.time_total
-        return self.th, infos, stats
+        return new_th, infos, stats
 
     def _fit_i(self, i: int, samples: ArrayLike, xA_i: ArrayLike, xB_i: ArrayLike, prefs_i: ArrayLike,
                dist_i: ArrayLike = None, mu_th: float = None, update: bool = True,
@@ -485,6 +543,9 @@ class PrefGNEP:
         info: MinimizeInfo
             Optimization information for the fitting process of player i, including convergence details.
         """
+        if not self._compiled:
+            self._build_loss_fns()
+
         start_fit = timer()
         th_i = copy.deepcopy(th_0) if th_0 is not None else copy.deepcopy(self.th[i])
         th_curr = copy.deepcopy(self.th[i])
@@ -493,50 +554,47 @@ class PrefGNEP:
         if dist_i is None:
             dist_i = jnp.ones_like(prefs_i)  # If no distance weights are provided, use uniform weights (i.e., no weighting)
 
-        @jax.jit
-        def loss_fnc(th: ArrayLike) -> float:
-            """
-            Computes the loss for player i given parameters th.
-            """
-            M = samples.shape[0]  # Size of dataset
+        # Pad arrays to _max_size when inside fit_AL_loop (prevents JAX recompilation on each shape change)
+        if self._max_size is not None:
+            M = samples.shape[0]
+            pad = self._max_size - M
 
-            @jax.jit
-            def single_loss(x_j: ArrayLike, xA_j: ArrayLike, xB_j: ArrayLike, p_j: float, dist_j: float) -> float:
-                fA = self.fc[i](th, xA_j, self.x_mi(x_j, i))
-                fB = self.fc[i](th, xB_j, self.x_mi(x_j, i))
-                P = 1. / (1. + jnp.exp((fA - fB) / (dist_j)))
-                V = - p_j * jnp.log(P + self.epsilon) - (1. - p_j) * jnp.log(1. - P + self.epsilon)
-                return V
+            def _pad(arr, fill=0.0):
+                return jnp.concatenate([arr, jnp.full((pad,) + arr.shape[1:], fill)], axis=0)
+            samples = _pad(samples)
+            xA_i = _pad(xA_i)
+            xB_i = _pad(xB_i)
+            prefs_i = _pad(prefs_i)
+            dist_i = _pad(dist_i, fill=1.0)  # non-zero fill avoids division-by-zero in padded rows
+            mask = jnp.concatenate([jnp.ones(M), jnp.zeros(pad)])
+        else:
+            mask = jnp.ones(samples.shape[0])
 
-            total_loss = jnp.sum(jax.vmap(single_loss, in_axes=(0, 0, 0, 0, 0))(samples, xA_i, xB_i, prefs_i, dist_i)) / M
-
-            for param, param_0 in zip(jax.tree_util.tree_leaves(th), jax.tree_util.tree_leaves(th_curr)):
-                total_loss += self.rho_th * (jnp.sum(param ** 2))
-                total_loss += _mu_th * jnp.sum((param - param_0) ** 2)
-            return total_loss
+        loss_fnc = functools.partial(
+            self._loss_fns[i],
+            samples=samples, xA_i=xA_i, xB_i=xB_i,
+            prefs_i=prefs_i, dist_i=dist_i, mask=mask,
+            th_curr=th_curr, mu_th=jnp.array(_mu_th),
+        )
+        solver = jaxopt.ScipyBoundedMinimize(
+            fun=loss_fnc, method='L-BFGS-B',
+            jit=self.jit,
+            tol=self.lbfgs_tol,
+            maxiter=self.lbfgs_maxiter,
+            options={"maxls": self.lbfgs_maxls, 'iprint': self.verbose,
+                     'gtol': self.lbfgs_tol, 'ftol': self.lbfgs_tol,
+                     'maxcor': self.memory, 'maxfun': self.lbfgs_epochs},
+        )
 
         # Run Adam solver
         start_adam = timer()
-
-        def JdJ(z_leaves, z_treedef):
-            return jax.value_and_grad(loss_fnc)(z_treedef.unflatten(z_leaves))
-
         if self.adam_epochs > 0:
-            th_i, loss_adam = adam_solver(JdJ, th_i, self.adam_epochs, self.adam_eta,
+            th_i, loss_adam = adam_solver(jax.value_and_grad(loss_fnc), th_i, self.adam_epochs, self.adam_eta,
                                           self.verbose, self.th_min[i], self.th_max[i])
         end_adam = timer()
 
         # Run L-BFGS solver
         start_lbfgs = timer()
-        # TODO: Use ScipyMinimize if we have no bounds
-        solver = jaxopt.ScipyBoundedMinimize(fun=loss_fnc, method='L-BFGS-B',
-                                             jit=self.jit,
-                                             tol=self.lbfgs_tol,
-                                             maxiter=self.lbfgs_maxiter,
-                                             options={"maxls": self.lbfgs_maxls, 'iprint': self.verbose,
-                                                      'gtol': self.lbfgs_tol, 'ftol': self.lbfgs_tol,
-                                                      'maxcor': self.memory, 'maxfun': self.lbfgs_epochs})
-
         bounds = (self.th_min[i], self.th_max[i]) if (self.th_min[i] is not None and self.th_max[i] is not None) else None
         th_i, info_lbfgs = solver.run(th_i, bounds=bounds)
         end_lbfgs = timer()
@@ -1111,8 +1169,9 @@ class PrefGNEP:
             proba.append(proba_i)
         return proba
 
-    def generate_initial_dataset(self, f, n_samples: int = 10, delta: float = 0.1,
-                                 dist_metric: str | None = None, dist_weight: float | None = None) -> DataSet:
+    def generate_initial_dataset(self, f, n_samples: int = 10, delta: float = 0.1, seed: int | None = None,
+                                 dist_metric: str | None = None, dist_weight: float | None = None,
+                                 verbose: int = 1) -> DataSet:
         """
         Generate a dataset of decision variables and preferences for all players.
 
@@ -1128,6 +1187,10 @@ class PrefGNEP:
             Distance metric to use for weighting the samples in the dataset. Defaults to DataSet default.
         dist_weight : float or None, optional
             Weight to apply to the distance-based weights in the dataset. Defaults to DataSet default.
+        seed : int or None, optional
+            Random seed for reproducibility. If None, a random seed is generated. Default is None.
+        verbose : int, optional
+            Verbosity level. If 0, tqdm progress bars are disabled. If > 0, progress bars are shown. Default is 1.
 
         Returns
         -------
@@ -1140,21 +1203,24 @@ class PrefGNEP:
             raise ValueError("generate_initial_dataset() requires compact box constraints, but lb contains -inf.")
         if jnp.any(jnp.isinf(jnp.asarray(self.ub))):
             raise ValueError("generate_initial_dataset() requires compact box constraints, but ub contains inf.")
+        if seed is None:
+            seed = np.random.randint(0, 1e6)
 
         # Sample uniformly in lb and ub
-        X_init_temp = jax.random.uniform(jax.random.PRNGKey(0), (n_samples, self.dim), minval=self.lb, maxval=self.ub)
+        X_init_temp = jax.random.uniform(jax.random.PRNGKey(seed), (n_samples, self.dim), minval=self.lb, maxval=self.ub)
         X_init = jnp.array([self.project_to_feasible(x).x for x in X_init_temp])
 
         X_pref_A = [[] for _ in range(self.N)]
         X_pref_B = [[] for _ in range(self.N)]
         prefs = [[] for _ in range(self.N)]
 
-        for i in tqdm(range(self.N), desc="Generating preferences for players", leave=True):
-            for j in tqdm(range(n_samples), leave=False, desc="Samples"):
+        for i in tqdm(range(self.N), desc="Generating preferences for players", leave=True, disable=verbose == 0):
+            for j in tqdm(range(n_samples), leave=False, desc="Samples", disable=verbose == 0):
                 # Sample a random direction for player i
-                key = jax.random.PRNGKey(i * n_samples + j)
+                key = jax.random.PRNGKey(i * n_samples + j + seed)
                 direction = jax.random.normal(key, (self.sizes[i],))
                 direction = direction / jnp.linalg.norm(direction)
+                direction = jax.random.uniform(key, (self.sizes[i],), minval=0.0, maxval=1.0) * direction
                 x_i, _ = self.split_x(X_init[j], i)
 
                 # Add perturbation in opposite directions and project back to feasible set to create two options for player i
@@ -1281,7 +1347,7 @@ class PrefGNEP:
         return self.fc[i](self.th[i], x_i, x_minus_i)
 
     def augment_dataset_AL(self, ds: DataSet, f, delta: float = 1.0, sigma: float = 1e-1, x0: ArrayLike = None,
-                           space_fill: bool = False, ps_iters: int = 100) -> DataSet:
+                           space_fill: bool = False, ps_iters: int = 100, seed: int | None = None) -> DataSet:
         """
         Augments the dataset by adding a new sample that balances exploration and exploitation.
 
@@ -1304,6 +1370,8 @@ class PrefGNEP:
             Whether to use space-filling for exploration. If False, random sampling is used. Default is False.
         ps_iters : int, optional
             Number of iterations for the particle swarm optimization when using space-filling. Default is 100.
+        seed : int or None, optional
+            Random seed for generation of new random xi when space_fill is False. Default is 0.
 
         Returns
         -------
@@ -1316,11 +1384,13 @@ class PrefGNEP:
             raise ValueError("augment_dataset_AL() only supports compact box constraints, but lb contains -inf.")
         if jnp.any(jnp.isinf(jnp.asarray(self.ub))):
             raise ValueError("augment_dataset_AL() only supports compact box constraints, but ub contains inf.")
+        if seed is None:
+            seed = 0
 
         if not space_fill:  # Option 1: Use a random xi for each player within bounds
             new_xi = []
             for i in range(self.N):
-                new_xi.append(jax.random.uniform(jax.random.PRNGKey(ds.size * self.N + i),
+                new_xi.append(jax.random.uniform(jax.random.PRNGKey(ds.size * self.N + i + seed),
                                                  (self.sizes[i],),
                                                  minval=self.x_i(self.lb, i),
                                                  maxval=self.x_i(self.ub, i)))
@@ -1389,7 +1459,7 @@ class PrefGNEP:
                     store_gnep_sol: bool = False, store_accuracy: bool = False, store_best_th: bool = True,
                     min_iters: int = 0, mu_th: float = 0.0, it_add_mu: int = None,
                     hist: SimpleNamespace = None, space_fill: bool = False, ps_iters: int = 100, verbose: int = 1,
-                    seed: int | None = None) -> tuple[ArrayLike, list[ArrayLike], list[ArrayLike], list[ArrayLike], dict]:
+                    seed: int = 0) -> tuple[ArrayLike, list[ArrayLike], list[ArrayLike], list[ArrayLike], dict]:
         """
         Active learning loop to fit the surrogate functions. At each iteration, the dataset is augmented using an
         exploitation-exploration strategy. The surrogate functions are refit at each iteration using the updated dataset,
@@ -1487,7 +1557,7 @@ class PrefGNEP:
 
         if hist is not None:
             assert isinstance(hist, ALloopInfo), "Expected hist to be an ALLoopInfo object"
-            hist.to_list()  # Convert any arrays in hist to lists so that appending works
+            hist = hist.to_list()  # Convert any arrays in hist to lists so that appending works
         else:
             hist = ALloopInfo()
 
@@ -1504,7 +1574,7 @@ class PrefGNEP:
         if it_add_mu is not None:
             assert it_add_mu >= 0, "Expected it_add_mu to be a non-negative integer"
         else:
-            it_add_mu = n_iters - n_iters // 4  # Default: start adding mu_th in the last quarter of iterations
+            it_add_mu = n_iters - n_iters // 16  # Default: start adding mu_th in the last eighth of iterations
 
         assert delta >= 0.0, "Expected delta to be non-negative"
         assert sigma >= 0.0, "Expected sigma to be non-negative"
@@ -1522,7 +1592,9 @@ class PrefGNEP:
             error_msg = ""  # We store warning or error messages and print them at the end to avoid messing with tqdm display
 
         th_0 = copy.deepcopy(self.th)
+        self._max_size = ds.size + n_iters
 
+        best_eval_norm = np.inf
         should_exit = False
         for it in range(n_iters):
 
@@ -1544,21 +1616,20 @@ class PrefGNEP:
             _, _, stats = self.fit(ds, update=True, mu_th=_mu_th, th_0=th_0)
 
             ds, info_aug_ds = self.augment_dataset_AL(ds, f, delta=delta_it, sigma=sigma_it, x0=x0,
-                                                      space_fill=space_fill, ps_iters=ps_iters)
+                                                      space_fill=space_fill, ps_iters=ps_iters, seed=seed)
             hist.res_ds_gnep.append(info_aug_ds.res_gnep)
             hist.res_ds_br.append(info_aug_ds.res_br)
-            if info_aug_ds.msg_error != "":
+            if info_aug_ds.msg_error != "" and verbose > 0:
                 error_msg += f" > Iteration {it} (augment_dataset_AL): {info_aug_ds.msg_error}\n"
 
             # Compute data and stopping criteria
             exit_gnep = exit_eval = False
             hist.times.append(stats.time)
-            best_eval_norm = np.inf
             if store_gnep_sol or tol_gnep > 0.0 or f_eval is not None:
                 sol_gnep = self.solve_gnep(x0)
                 hist.res_x_star.append(float(jnp.linalg.norm(sol_gnep.res, ord=np.inf)))
                 hist.x_star.append(sol_gnep.x)
-                if sol_gnep.msg_error != "":
+                if sol_gnep.msg_error != "" and verbose > 0:
                     error_msg += f" > Iteration {it} (x_star): {sol_gnep.msg_error}\n"
                 if tol_gnep > 0.0 and it > 0:
                     norm_diff = jnp.linalg.norm(hist.x_star[-1] - hist.x_star[-2], ord=jnp.inf)
@@ -1577,7 +1648,7 @@ class PrefGNEP:
                     if store_best_th and f_eval is not None:
                         if eval_norm < best_eval_norm:
                             best_eval_norm = eval_norm
-                            hist._replace(best_th=copy.deepcopy(self.th))
+                            hist = hist._replace(best_th=copy.deepcopy(self.th))
             if store_accuracy:
                 acc = self.accuracy_score(ds)
                 hist.accuracy.append(acc)
@@ -1615,6 +1686,8 @@ class PrefGNEP:
         # Convert lists to arrays in hist for easier use later
         hist = hist.to_array()
         hist = hist.assign_n_iters()
+
+        self._max_size = None
 
         if verbose > 0:
             iters_tqdm.close()

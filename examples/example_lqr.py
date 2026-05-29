@@ -57,23 +57,23 @@ from pref_gnep import PrefGNEP  # noqa: E402
 from dataset import DataSet  # noqa: E402
 from models import gen_quad_models  # noqa: E402
 
-seed = 1
+seed = 1234
 np.random.seed(seed)
 
 # %% #################################
 # Problem setup
 ######################################
 
-problem_size = "large"  # "small", "medium" or "large"
+problem_size = "small"  # "small", "medium" or "large"
 gen_dataset = True  # Whether to generate a new dataset or load existing one
 save_plots = True  # Whether to save the plots
 ds_size_init = 50  # Dimension of initial dataset
-n_iters_AL = 200  # Number of iterations of the AL loop
+n_iters_AL = 100  # Number of iterations of the AL loop
 delta = 5.0  # Exploration parameter in the AL loop
 p_delta = 5.0  # Exponent for exploration parameter decay in the AL loop
-delta_min = 1e-3  # Minimum value of exploration parameter in the AL loop
+delta_min = 1e-4  # Minimum value of exploration parameter in the AL loop
 sigma = 0.3  # Noise parameter for the AL loop
-p_sigma = 4.0  # Exponent for noise parameter decay in the AL loop
+p_sigma = 3.0  # Exponent for noise parameter decay in the AL loop
 sigma_min = 1e-3  # Minimum value of noise parameter in the AL loop
 n_tests = 100  # Number of closed-loop simulations to run for post-learning evaluation
 dare_iters = 50  # number of iterations for DARE solver
@@ -173,7 +173,7 @@ th_0, fc, th_min, th_max = gen_quad_models(sizes, full=False, diagonal=True, wit
 pref_gnep = PrefGNEP(sizes=sizes, fc=fc, lb=lb, ub=ub)
 pref_gnep.init(th=th_0, th_min=th_min, th_max=th_max, alpha1=0.0, alpha2=0.01)
 pref_gnep.loss(rho_th=0.001)
-pref_gnep.optimization(adam_epochs=0)
+pref_gnep.optimization(adam_epochs=500, adam_eta=0.001)
 
 # Generate initial dataset
 if gen_dataset:
